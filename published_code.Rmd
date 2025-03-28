@@ -1,0 +1,199 @@
+---
+title: "Pseudomonas tolerance paper code"
+output: html_notebook
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Transcriptomic analysis
+
+### Build hisat database from NCBI reference and align reads
+
+```{bash, message = FALSE, results = FALSE}}
+hisat2-build -p 16 20240209_Pseudomonas_aeruginosa_PAO1_NCBI_RefSeq.fna PAO1 # build hisat database
+
+i=$(sed -n "$SLURM_ARRAY_TASK_ID"p ~/RNAseq.sample.names.txt)
+
+hisat2 -p 16 -q --phred33 \
+--summary-file ~/aligned.reads/"$i"alignment.summary.txt \
+-x ~/PAO1_DB/hisat2/PAO1 \
+-1 ~/trimmed.reads/"$i"R1_001.fastq.gz \
+-2 ~/trimmed.reads/"$i"R2_001.fastq.gz \
+-S ~/aligned.reads/"$i"aligned.reads.sam
+```
+
+
+### Convert SAM to BAM using samtools
+
+```{bash, message = FALSE, results = FALSE}
+i=$(sed -n "$SLURM_ARRAY_TASK_ID"p ~/RNAseq.sample.names.txt)
+
+module purge
+
+module load samtools/1.9
+
+samtools \
+view -bS ~/"$i"_aligned.reads.sam > \
+~/"$i"_aligned.reads.bam
+
+samtools \
+sort ~/"$i"_aligned.reads.bam > ~/"$i"_aligned.reads.sorted.bam
+
+samtools \
+flagstat ~/"$i"_aligned.reads.sorted.bam > ~/flagstat/"$i"_bam.flagstat
+
+module purge
+```
+
+
+### Count reads with featureCounts
+
+```{bash, message = FALSE, results = FALSE}
+i=$(sed -n "$SLURM_ARRAY_TASK_ID"p ~/RNAseq.sample.names.txt)
+
+conda activate RNAseq
+
+featureCounts \
+-a ~/PAO1_DB/20240207_Pseudomonas_aeruginosa_PAO1_NCBI_RefSeq.gtf \
+-o ~/featureCounts/"$i"_featurecounts.out.txt \
+~/"$i"_aligned.reads.sorted.bam \
+-p -O -t gene -g gene_id -f -d 10 --verbose
+
+conda deactivate
+```
+
+
+### Load R packages
+
+```{r, message = FALSE, include = FALSE}
+library(tidyverse)
+library(factoextra)
+library(RColorBrewer)
+library(DESeq2)
+library(EnhancedVolcano)
+library(ggtext)
+library(ggrepel)
+library(cowplot)
+library(rstatix)
+```
+
+
+### Set up DESeq2 parameters
+
+```{r, message = FALSE, include = FALSE}
+samples <- unique(read_counts$sample) # create vector of sample names
+
+condition <- c(rep("condition",3),
+               rep("control",3)) # create vector of conditions
+
+data.frame(samples, condition,
+           row.names = samples) -> colData # join vectors together to colData object
+
+read_counts %>%
+  dplyr::select(Geneid,sample,counts) %>% # select only samples and counts
+  pivot_wider(names_from = sample,
+              values_from = counts) %>% # make sample names column names
+  column_to_rownames("Geneid") -> read_counts # set Geneid as row names
+
+all(rownames(colData) == colnames(read_counts)) # check row names and col names match
+```
+
+
+### Run DESeq
+
+```{r, message = FALSE, include = FALSE}
+dds <- DESeqDataSetFromMatrix(countData = read_counts,
+                              colData = colData,
+                              design = ~condition)
+dds
+
+dds2 <- DESeq(dds)
+
+sF <- sizeFactors(dds2)
+
+vsd <- varianceStabilizingTransformation(dds2, 
+                                         blind = TRUE) # VST normalization
+
+vsdOut <- (assay(vsd))
+
+ddsOut <- (assay(dds2))
+```
+
+
+### Generate PCA from normalized counts
+
+```{r, message = FALSE, include = FALSE}
+ddsMat <- t(ddsOut) # transpose matrix 
+
+ddsPrcomp <- prcomp(ddsMat) # generate PCA
+
+fviz_eig(ddsPrcomp) # plot eigenvalues
+
+fviz_pca_ind(ddsPrcomp,
+             repel = TRUE)
+```
+
+
+PCA shows LB3 and CL3 are outliers and therefore are removed from further analysis
+
+### Set up DESeq2 parameters - no outliers
+
+```{r, message = FALSE, include = FALSE}
+samples_NO <- unique(read_counts_NO$sample) # create vector of sample names
+
+condition_NO <- c(rep("condition",2),
+               rep("control",2)) # create vector of conditions
+
+data.frame(samples_NO, condition_NO,
+           row.names = samples_NO) -> colDataNO # join vectors together to colData object
+
+read_counts_NO %>%
+  dplyr::select(Geneid,sample,counts) %>% # select only samples and counts
+  pivot_wider(names_from = sample,
+              values_from = counts) %>% # make sample names column names
+  column_to_rownames("Geneid") -> read_counts_NO # set Geneid as row names
+
+all(rownames(colDataNO) == colnames(read_counts_NO)) # check row names and col names match
+```
+
+
+### Run DESeq - no outliers
+
+```{r, message = FALSE, include = FALSE}
+ddsNO <- DESeqDataSetFromMatrix(countData = read_counts_NO,
+                                colData = colData,
+                                design = ~condition)
+ddsNO
+
+dds2NO <- DESeq(ddsNO)
+
+sFNO <- sizeFactors(dds2NO)
+
+vsdNO <- varianceStabilizingTransformation(dds2NO,
+                                           blind = TRUE) # VST normalization
+
+vsdOutNO <- (assay(vsdNO))
+
+ddsOutNO <- (assay(dds2NO))
+```
+
+
+# Time course survival data
+
+### ANOVA and Tukey post-hoc tests
+
+```{r, message = FALSE, include = FALSE}
+df$time <- factor(df$time)
+
+df %>%
+  mutate(count_norm = count + 0.01) -> df
+
+aov(count_norm ~ time * strain, data = df) -> df_anova
+
+summary(df_anova)
+
+tukey_hsd(df_anova)
+```
